@@ -1,0 +1,18 @@
+# Ignored
+
+blofh
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.txt
+coverage.out
+vendor/
+.vscode/
+.history/
+*.code-workspace
+tmp/
+*.log
