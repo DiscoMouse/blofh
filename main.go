@@ -14,14 +14,13 @@ import (
 const (
 	cinsURL     = "http://cinsscore.com/list/ci-badguys.txt"
 	spamhausURL = "https://www.spamhaus.org/drop/dropv6.txt"
+	chunkSize   = 500
 )
 
-// Executor defines how we send rules to the system
 type Executor interface {
 	Execute(input string) error
 }
 
-// NftExecutor is the production implementation that calls the 'nft' binary
 type NftExecutor struct{}
 
 func (n NftExecutor) Execute(input string) error {
@@ -32,39 +31,64 @@ func (n NftExecutor) Execute(input string) error {
 }
 
 func main() {
-	// 1. Fetch data from remote sources
 	v4List := fetchAndValidate(cinsURL, false)
 	v6List := fetchAndValidate(spamhausURL, true)
 
-	// 2. Build the transaction string
-	transaction := BuildTransaction(v4List, v6List)
+	nft := NftExecutor{}
 
-	// 3. Execute using the NftExecutor
-	exec := NftExecutor{}
-	if err := exec.Execute(transaction); err != nil {
-		fmt.Printf("Failed to update nftables: %v\n", err)
+	// 1. Flush the sets first
+	flushCmd := "flush set inet filter cins_blackhole_v4\nflush set inet filter spamhaus_blackhole_v6\n"
+	if err := nft.Execute(flushCmd); err != nil {
+		fmt.Printf("Failed to flush nftables sets: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Printf("Success: Loaded %d IPv4 and %d IPv6 entries.\n", len(v4List), len(v6List))
+	// 2. Chunk and load IPv4
+	v4Chunks := chunkSlice(v4List, chunkSize)
+	for _, chunk := range v4Chunks {
+		transaction := BuildTransactionChunk("cins_blackhole_v4", chunk)
+		if err := nft.Execute(transaction); err != nil {
+			fmt.Printf("Failed loading IPv4 chunk: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	// 3. Chunk and load IPv6
+	v6Chunks := chunkSlice(v6List, chunkSize)
+	for _, chunk := range v6Chunks {
+		transaction := BuildTransactionChunk("spamhaus_blackhole_v6", chunk)
+		if err := nft.Execute(transaction); err != nil {
+			fmt.Printf("Failed loading IPv6 chunk: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	fmt.Printf("Success: Loaded %d IPv4 and %d IPv6 entries in chunks of %d.\n", len(v4List), len(v6List), chunkSize)
 }
 
-// BuildTransaction creates the actual nftables syntax
-func BuildTransaction(v4 []string, v6 []string) string {
+func BuildTransactionChunk(setName string, ips []string) string {
 	var sb strings.Builder
-	sb.WriteString("flush set inet filter cins_blackhole_v4\n")
-	for _, ip := range v4 {
-		fmt.Fprintf(&sb, "add element inet filter cins_blackhole_v4 { %s }\n", ip)
+	if len(ips) == 0 {
+		return ""
 	}
-
-	sb.WriteString("flush set inet filter spamhaus_blackhole_v6\n")
-	for _, ip := range v6 {
-		fmt.Fprintf(&sb, "add element inet filter spamhaus_blackhole_v6 { %s }\n", ip)
-	}
+	sb.WriteString(fmt.Sprintf("add element inet filter %s { ", setName))
+	sb.WriteString(strings.Join(ips, ", "))
+	sb.WriteString(" }\n")
 	return sb.String()
 }
 
-// fetchAndValidate handles the HTTP request and parsing
+func chunkSlice(slice []string, size int) [][]string {
+	var chunks [][]string
+	for i := 0; i < len(slice); i += size {
+		end := i + size
+		if end > len(slice) {
+			end = len(slice)
+		}
+		chunks = append(chunks, slice[i:end])
+	}
+	return chunks
+}
+
 func fetchAndValidate(url string, isV6 bool) []string {
 	resp, err := http.Get(url)
 	if err != nil {
@@ -75,7 +99,6 @@ func fetchAndValidate(url string, isV6 bool) []string {
 	return parseList(resp.Body, isV6)
 }
 
-// parseList is the internal logic that can be tested with any io.Reader
 func parseList(r io.Reader, isV6 bool) []string {
 	var valid []string
 	scanner := bufio.NewScanner(r)
@@ -89,33 +112,27 @@ func parseList(r io.Reader, isV6 bool) []string {
 	return valid
 }
 
-// validateLine performs the strict type-checking for a single string
 func validateLine(line string, isV6 bool) (string, bool) {
 	line = strings.TrimSpace(line)
-	// Skip comments and empty lines
 	if line == "" || strings.HasPrefix(line, ";") || strings.HasPrefix(line, "#") {
 		return "", false
 	}
 
-	// Extract the first field (IP/CIDR)
 	parts := strings.Fields(line)
 	if len(parts) == 0 {
 		return "", false
 	}
 	rawIP := parts[0]
 
-	// Try parsing as Prefix (CIDR)
 	prefix, err := netip.ParsePrefix(rawIP)
 	if err != nil {
-		// Try parsing as single Addr
 		addr, err := netip.ParseAddr(rawIP)
 		if err != nil {
-			return "", false // Garbage
+			return "", false
 		}
 		prefix = netip.PrefixFrom(addr, addr.BitLen())
 	}
 
-	// Ensure protocol family matches
 	if isV6 && prefix.Addr().Is6() {
 		return prefix.String(), true
 	} else if !isV6 && prefix.Addr().Is4() {
